@@ -1,150 +1,211 @@
 package de.spinscale.netty.http.pipelining;
 
-import io.netty.bootstrap.ServerBootstrap;
 import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufUtil;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.ChannelHandlerContext;
-import io.netty.channel.ChannelInitializer;
 import io.netty.channel.SimpleChannelInboundHandler;
-import io.netty.channel.nio.NioEventLoopGroup;
-import io.netty.channel.socket.SocketChannel;
-import io.netty.channel.socket.nio.NioServerSocketChannel;
-import io.netty.handler.codec.http.*;
+import io.netty.channel.embedded.EmbeddedChannel;
+import io.netty.handler.codec.http.DefaultFullHttpRequest;
+import io.netty.handler.codec.http.DefaultFullHttpResponse;
+import io.netty.handler.codec.http.DefaultHttpRequest;
+import io.netty.handler.codec.http.FullHttpRequest;
+import io.netty.handler.codec.http.FullHttpResponse;
+import io.netty.handler.codec.http.HttpMethod;
+import io.netty.handler.codec.http.HttpRequest;
+import io.netty.handler.codec.http.HttpVersion;
+import io.netty.handler.codec.http.LastHttpContent;
+import io.netty.handler.codec.http.QueryStringDecoder;
 import org.junit.After;
 import org.junit.Test;
 
-import java.net.InetSocketAddress;
+import java.nio.channels.ClosedChannelException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
-import java.util.Collection;
+import java.util.Collections;
 import java.util.List;
+import java.util.Map;
+import java.util.Queue;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedTransferQueue;
 import java.util.concurrent.TimeUnit;
 
-import static io.netty.handler.codec.http.HttpHeaders.Names.CONTENT_LENGTH;
+import static io.netty.handler.codec.http.HttpHeaderNames.CONTENT_LENGTH;
 import static io.netty.handler.codec.http.HttpResponseStatus.OK;
 import static io.netty.handler.codec.http.HttpVersion.HTTP_1_1;
 import static org.hamcrest.MatcherAssert.assertThat;
-import static org.hamcrest.Matchers.contains;
-import static org.hamcrest.Matchers.hasSize;
+import static org.hamcrest.core.Is.is;
+import static org.junit.Assert.assertNotNull;
 
 public class HttpPipeliningHandlerTest {
 
-    private static int PORT = 63422;
-    private final InetSocketAddress address = new InetSocketAddress("localhost", PORT);;
-
-    private ServerBootstrap serverBootstrap;
-    private ExecutorService executorService;
+    private ExecutorService executorService = Executors.newFixedThreadPool(5);
+    private Map<String, CountDownLatch> waitingRequests = new ConcurrentHashMap<>();
 
     @After
-    public void shutdownHttpServer() throws InterruptedException {
-        serverBootstrap.group().shutdownGracefully().awaitUninterruptibly();
+    public void closeResources() throws InterruptedException {
+        // finish all waitingReqeusts
+        for (CountDownLatch latch : waitingRequests.values()) {
+            while (latch.getCount() > 0) latch.countDown();
+        }
+
         executorService.shutdown();
         executorService.awaitTermination(10, TimeUnit.SECONDS);
     }
 
     @Test
-    public void testThatPipeliningWorks() throws InterruptedException {
-        createHttpServer(10000);
+    public void testThatPipeliningWorksWithFastSerializedRequests() throws InterruptedException {
+        EmbeddedChannel embeddedChannel = new EmbeddedChannel(new HttpPipeliningHandler(10000), new WorkEmulatorHandler());
 
-        try (HttpClient client = new HttpClient()) {
-            Collection<FullHttpResponse> responses = client.sendRequests(address, "/firstfast", "/slow?sleep=250", "/secondfast", "/slow?sleep=500", "/thirdfast");
-            assertThat(responses, hasSize(5));
-            List<String> responseContents = toString(responses);
-            assertThat(responseContents, contains("0", "1", "2", "3", "4"));
+        for (int i = 0; i < 5; i++) {
+            embeddedChannel.writeInbound(createHttpRequest("/" + String.valueOf(i)));
         }
+
+        for (CountDownLatch latch : waitingRequests.values()) {
+            latch.countDown();
+        }
+
+        Thread.sleep(10);
+
+        for (int i = 0; i < 5; i++) {
+            assertReadHttpMessageHasContent(embeddedChannel, String.valueOf(i));
+        }
+
+        assertThat(embeddedChannel.isOpen(), is(true));
     }
 
     @Test
+    public void testThatPipeliningWorksWhenSlowRequestsInDifferentOrder() throws InterruptedException {
+        EmbeddedChannel embeddedChannel = new EmbeddedChannel(new HttpPipeliningHandler(10000), new WorkEmulatorHandler());
+
+        for (int i = 0; i < 5; i++) {
+            embeddedChannel.writeInbound(createHttpRequest("/" + String.valueOf(i)));
+        }
+
+        // random order execution..
+        List<CountDownLatch> latches = new ArrayList<>(waitingRequests.values());
+        Collections.shuffle(latches);
+        for (CountDownLatch latch : latches) {
+            latch.countDown();
+        }
+
+        Thread.sleep(10);
+
+        for (int i = 0; i < 5; i++) {
+            assertReadHttpMessageHasContent(embeddedChannel, String.valueOf(i));
+        }
+
+        assertThat(embeddedChannel.isOpen(), is(true));
+    }
+
+    @Test
+    public void testThatPipeliningWorksWithChunkedRequests() throws InterruptedException {
+        EmbeddedChannel embeddedChannel = new EmbeddedChannel(new AggregateUrisAndHeadersHandler(), new HttpPipeliningHandler(10000), new WorkEmulatorHandler());
+
+        DefaultHttpRequest httpRequest = new DefaultHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, "/0");
+        embeddedChannel.writeInbound(httpRequest);
+        embeddedChannel.writeInbound(LastHttpContent.EMPTY_LAST_CONTENT);
+
+        httpRequest = new DefaultHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, "/1");
+        embeddedChannel.writeInbound(httpRequest);
+        embeddedChannel.writeInbound(LastHttpContent.EMPTY_LAST_CONTENT);
+
+        waitingRequests.get("1").countDown();
+        waitingRequests.get("0").countDown();
+
+        Thread.sleep(10);
+
+        for (int i = 0; i < 2; i++) {
+            assertReadHttpMessageHasContent(embeddedChannel, String.valueOf(i));
+        }
+
+        assertThat(embeddedChannel.isOpen(), is(true));
+    }
+
+    @Test(expected = ClosedChannelException.class)
     public void testThatPipeliningClosesConnectionWithTooManyEvents() throws InterruptedException {
-        // TODO this needs better testing... just letting the latch timeout is not too awesome
-        createHttpServer(2);
+        EmbeddedChannel embeddedChannel = new EmbeddedChannel(new HttpPipeliningHandler(2), new WorkEmulatorHandler());
 
-        try (HttpClient client = new HttpClient()) {
-            Collection<FullHttpResponse> responses = client.sendRequests(address, "/slow?sleep=500", "/slow?sleep=400", "/slow?sleep=100");
-            assertThat(responses, hasSize(0));
+        embeddedChannel.writeInbound(createHttpRequest("/0"));
+        // this two are put in the queue
+        embeddedChannel.writeInbound(createHttpRequest("/1"));
+        embeddedChannel.writeInbound(createHttpRequest("/2"));
+        embeddedChannel.writeInbound(createHttpRequest("/3"));
+
+        // finish two requests to fill up the queue
+        waitingRequests.get("1").countDown();
+        waitingRequests.get("2").countDown();
+
+        // this will close the channel
+        waitingRequests.get("3").countDown();
+
+        // this will throw an exception
+        Thread.sleep(10);
+        embeddedChannel.writeInbound(createHttpRequest("/"));
+    }
+
+
+    private void assertReadHttpMessageHasContent(EmbeddedChannel embeddedChannel, String expectedContent) {
+
+        FullHttpResponse response = (FullHttpResponse) embeddedChannel.outboundMessages().poll();
+        assertNotNull("Expected response to exist, maybe you did not wait long enough?", response);
+        assertNotNull("Expected response to have content " + expectedContent, response.content());
+        String data = new String(ByteBufUtil.getBytes(response.content()), StandardCharsets.UTF_8);
+        assertThat(data, is(expectedContent));
+    }
+
+    private FullHttpRequest createHttpRequest(String uri) {
+        final FullHttpRequest httpRequest = new DefaultFullHttpRequest(HTTP_1_1, HttpMethod.GET, uri);
+        return httpRequest;
+    }
+
+    /**
+     *
+     */
+    private static class AggregateUrisAndHeadersHandler extends SimpleChannelInboundHandler<HttpRequest> {
+
+        public static final Queue<String> QUEUE_URI = new LinkedTransferQueue<>();
+
+        @Override
+        protected void channelRead0(ChannelHandlerContext ctx, HttpRequest request) throws Exception {
+            QUEUE_URI.add(request.uri());
         }
     }
 
-    public void createHttpServer(final int size) {
-        serverBootstrap = new ServerBootstrap();
-        serverBootstrap.channel(NioServerSocketChannel.class);
-        serverBootstrap.group(new NioEventLoopGroup());
-        serverBootstrap.childHandler(new ChannelInitializer<SocketChannel>() {
-            @Override
-            protected void initChannel(SocketChannel ch) throws Exception {
-                ch.pipeline()
-                        .addLast(new HttpServerCodec())
-                        .addLast(new HttpObjectAggregator(8192))
-                        .addLast(new HttpPipeliningHandler(size))
-                        .addLast(new TestingDelayHandler());
+    private class WorkEmulatorHandler extends SimpleChannelInboundHandler<HttpPipelinedRequest> {
+
+        @Override
+        protected void channelRead0(final ChannelHandlerContext ctx, final HttpPipelinedRequest pipelinedRequest) throws Exception {
+            final QueryStringDecoder decoder;
+            if (pipelinedRequest.getRequest() instanceof FullHttpRequest) {
+                final FullHttpRequest fullHttpRequest = (FullHttpRequest) pipelinedRequest.getRequest();
+                decoder = new QueryStringDecoder(fullHttpRequest.uri());
+            } else {
+                decoder = new QueryStringDecoder(AggregateUrisAndHeadersHandler.QUEUE_URI.poll());
             }
-        });
 
-        serverBootstrap.validate();
-        serverBootstrap.bind(PORT);
+            final String uri = decoder.path().replace("/", "");
+            ByteBuf content = Unpooled.copiedBuffer(uri, StandardCharsets.UTF_8);
+            final DefaultFullHttpResponse httpResponse = new DefaultFullHttpResponse(HTTP_1_1, OK, content);
+            httpResponse.headers().add(CONTENT_LENGTH, content.readableBytes());
 
-        executorService = Executors.newFixedThreadPool(5);
-    }
+            final CountDownLatch latch = new CountDownLatch(1);
+            waitingRequests.put(uri, latch);
 
-    private List<String> toString(Collection<FullHttpResponse> responses) {
-        List<String> responseContents = new ArrayList<>(responses.size());
-        for (FullHttpResponse response : responses) {
-            responseContents.add(response.content().toString(StandardCharsets.UTF_8));
-        }
-        return responseContents;
-    }
-
-
-    private class TestingDelayHandler extends SimpleChannelInboundHandler<HttpPipelinedRequest> {
-
-        public TestingDelayHandler() {
-            super();
-
-        }
-
-        @Override
-        protected void channelRead0(ChannelHandlerContext ctx, HttpPipelinedRequest msg) throws Exception {
-            executorService.submit(new PossiblySlowRunnable(ctx, msg));
-        }
-
-        @Override
-        public void exceptionCaught(ChannelHandlerContext ctx, Throwable e) {
-            e.getCause().printStackTrace();
-            ctx.channel().close();
-        }
-    }
-
-    private class PossiblySlowRunnable implements Runnable {
-
-        private final ChannelHandlerContext ctx;
-        private final HttpPipelinedRequest request;
-
-        public PossiblySlowRunnable(ChannelHandlerContext ctx, HttpPipelinedRequest request) {
-            this.ctx = ctx;
-            this.request = request;
-        }
-
-        public void run() {
-            ByteBuf buffer = Unpooled.copiedBuffer(request.getRequest().headers().get("X-Counting-Id"), StandardCharsets.UTF_8);
-            DefaultFullHttpResponse httpResponse = new DefaultFullHttpResponse(HTTP_1_1, OK, buffer);
-            httpResponse.headers().add(CONTENT_LENGTH, buffer.readableBytes());
-
-            String uri = request.getRequest().getUri();
-            QueryStringDecoder decoder = new QueryStringDecoder(uri);
-
-            final int timeout = uri.startsWith("/slow") && decoder.parameters().containsKey("sleep") ? Integer.valueOf(decoder.parameters().get("sleep").get(0)) : 0;
-            if (timeout > 0) {
-                try {
-                    Thread.sleep(timeout);
-                } catch (InterruptedException e) {
-                    e.printStackTrace();
+            executorService.submit(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        latch.await(2, TimeUnit.SECONDS);
+                        ctx.writeAndFlush(pipelinedRequest.createHttpResponse(httpResponse, ctx.channel().newPromise()));
+                    } catch (InterruptedException e) {
+                        e.printStackTrace();
+                    }
                 }
-            }
-
-            //System.out.println("Writing request " + request.getRequest().headers().get("X-Counting-Id"));
-            ctx.writeAndFlush(request.createHttpResponse(httpResponse, ctx.channel().newPromise()));
+            });
         }
     }
 }

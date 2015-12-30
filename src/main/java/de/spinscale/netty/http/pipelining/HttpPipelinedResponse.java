@@ -1,15 +1,15 @@
 package de.spinscale.netty.http.pipelining;
 
 import io.netty.channel.ChannelPromise;
-import io.netty.handler.codec.http.DefaultFullHttpResponse;
+import io.netty.handler.codec.http.HttpResponse;
 
 public class HttpPipelinedResponse implements Comparable<HttpPipelinedResponse> {
 
-    private final DefaultFullHttpResponse response;
+    private final HttpResponse response;
     private final ChannelPromise promise;
     private final int sequenceId;
 
-    public HttpPipelinedResponse(DefaultFullHttpResponse response, ChannelPromise promise, int sequenceId) {
+    public HttpPipelinedResponse(HttpResponse response, ChannelPromise promise, int sequenceId) {
         this.response = response;
         this.promise = promise;
         this.sequenceId = sequenceId;
@@ -19,7 +19,7 @@ public class HttpPipelinedResponse implements Comparable<HttpPipelinedResponse> 
         return sequenceId;
     }
 
-    public DefaultFullHttpResponse getResponse() {
+    public HttpResponse getResponse() {
         return response;
     }
 
