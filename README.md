@@ -25,10 +25,6 @@ serverBootstrap.bind(PORT);
 
 For more information, you can check out the test called `HttpPipeliningHandlerTest` (just press `t` in github and type `test` to check it out).
 
-# Limitations
-
-* No support for HTTP chunks. You have to add the `HttpObjectAggregator` **before** the pipelining handler, so the you get a `FullHttpRequest`.
-
 # License
 
 This is licensed under the Apache license, see LICENSE.txt
