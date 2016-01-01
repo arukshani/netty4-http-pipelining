@@ -48,12 +48,10 @@ public class HttpPipeliningHandlerTest {
     @After
     public void closeResources() throws InterruptedException {
         // finish all waitingReqeusts
-        for (CountDownLatch latch : waitingRequests.values()) {
-            while (latch.getCount() > 0) latch.countDown();
+        for (String url : waitingRequests.keySet()) {
+            finishRequest(url);
         }
-
-        executorService.shutdown();
-        executorService.awaitTermination(10, TimeUnit.SECONDS);
+        shutdownExecutorService();
     }
 
     @Test
@@ -64,11 +62,11 @@ public class HttpPipeliningHandlerTest {
             embeddedChannel.writeInbound(createHttpRequest("/" + String.valueOf(i)));
         }
 
-        for (CountDownLatch latch : waitingRequests.values()) {
-            latch.countDown();
+        for (String url : waitingRequests.keySet()) {
+            finishRequest(url);
         }
 
-        Thread.sleep(10);
+        shutdownExecutorService();
 
         for (int i = 0; i < 5; i++) {
             assertReadHttpMessageHasContent(embeddedChannel, String.valueOf(i));
@@ -86,13 +84,13 @@ public class HttpPipeliningHandlerTest {
         }
 
         // random order execution..
-        List<CountDownLatch> latches = new ArrayList<>(waitingRequests.values());
-        Collections.shuffle(latches);
-        for (CountDownLatch latch : latches) {
-            latch.countDown();
+        List<String> urls = new ArrayList<>(waitingRequests.keySet());
+        Collections.shuffle(urls);
+        for (String url : urls) {
+            finishRequest(url);
         }
 
-        Thread.sleep(10);
+        shutdownExecutorService();
 
         for (int i = 0; i < 5; i++) {
             assertReadHttpMessageHasContent(embeddedChannel, String.valueOf(i));
@@ -113,10 +111,10 @@ public class HttpPipeliningHandlerTest {
         embeddedChannel.writeInbound(httpRequest);
         embeddedChannel.writeInbound(LastHttpContent.EMPTY_LAST_CONTENT);
 
-        waitingRequests.get("1").countDown();
-        waitingRequests.get("0").countDown();
+        finishRequest("1");
+        finishRequest("0");
 
-        Thread.sleep(10);
+        shutdownExecutorService();
 
         for (int i = 0; i < 2; i++) {
             assertReadHttpMessageHasContent(embeddedChannel, String.valueOf(i));
@@ -136,25 +134,35 @@ public class HttpPipeliningHandlerTest {
         embeddedChannel.writeInbound(createHttpRequest("/3"));
 
         // finish two requests to fill up the queue
-        waitingRequests.get("1").countDown();
-        waitingRequests.get("2").countDown();
+        finishRequest("1");
+        finishRequest("2");
 
         // this will close the channel
-        waitingRequests.get("3").countDown();
+        finishRequest("3");
 
-        // this will throw an exception
-        Thread.sleep(10);
+        finishRequest("0");
+        shutdownExecutorService();
         embeddedChannel.writeInbound(createHttpRequest("/"));
     }
 
 
     private void assertReadHttpMessageHasContent(EmbeddedChannel embeddedChannel, String expectedContent) {
-
         FullHttpResponse response = (FullHttpResponse) embeddedChannel.outboundMessages().poll();
         assertNotNull("Expected response to exist, maybe you did not wait long enough?", response);
         assertNotNull("Expected response to have content " + expectedContent, response.content());
         String data = new String(ByteBufUtil.getBytes(response.content()), StandardCharsets.UTF_8);
         assertThat(data, is(expectedContent));
+    }
+
+    private void finishRequest(String url) {
+        waitingRequests.get(url).countDown();
+    }
+
+    private void shutdownExecutorService() throws InterruptedException {
+        if (!executorService.isShutdown()) {
+            executorService.shutdown();
+            executorService.awaitTermination(10, TimeUnit.SECONDS);
+        }
     }
 
     private FullHttpRequest createHttpRequest(String uri) {
